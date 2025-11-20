@@ -1,0 +1,5 @@
+clear
+source  /home/stuart/.config/postinsta
+cd /data2/nuascn
+export RUST_LOG="info"
+target/debug/nuascn
