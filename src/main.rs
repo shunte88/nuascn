@@ -702,6 +702,11 @@ async fn main() -> BoxResult<()> {
         );
     }
 
+    match fs::remove_file(OUTPUT_FILE) {
+            Ok(_) => {},
+            Err(_e) => {},
+    }
+
     if process_map.is_empty() {
         warn!("Nothing to process, we're done...");
         return Ok(());
@@ -794,10 +799,7 @@ async fn main() -> BoxResult<()> {
         }
 
     }
-    match fs::remove_file(OUTPUT_FILE) {
-            Ok(_) => {},
-            Err(_e) => {},
-    }
+
     Ok(())
 
 }
