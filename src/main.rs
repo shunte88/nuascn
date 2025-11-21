@@ -487,8 +487,8 @@ async fn main() -> BoxResult<()> {
     //sdx.check_premium().await?;
 
     // Generate HTML page URLs
-    // 31 first outing of the day, 1AM, else 16 pages
-    let pages: i32 = if h.hour()==13 {31} else {16};
+    // 31 first outing of the day, 1AM, else 11 pages
+    let pages: i32 = if h.hour()==1 {31} else {11};
     let mut urls: Vec<String> = build_urls(BASE_URL, pages);
 
     // Optional: seed with user-specified URL from command line
@@ -829,7 +829,7 @@ async fn aria2c_download(pe: &ProcessEntry) -> BoxResult<Aria2cResult> {
         pe.folder.clone().into(),
         "--out".into(),
         filename.clone(),
-        //"--quiet".into(),
+        "--quiet".into(),
         "--max-connection-per-server=16".into(),
         "--max-concurrent-downloads=16".into(),
         "--split=8".into(),
