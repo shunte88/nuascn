@@ -6,4 +6,6 @@ seen_files
 *.rss
 nuafoo
 /logs
-reget
+reget*
+fixrerun
+

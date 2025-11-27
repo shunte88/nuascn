@@ -44,8 +44,11 @@ use futures::future::join_all;
 use chrono::{DateTime, FixedOffset, Utc, Local};
 use chrono::Timelike;
 
+use std::io::Seek;
+use std::ops::Range;
 use futures::{stream, StreamExt};
 use reqwest::{Client, StatusCode};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, RANGE};
 use rss::{Channel, ChannelBuilder, Item, ItemBuilder};
 use scraper::{Html, Selector};
 use tokio::time::{error::Elapsed, sleep};
@@ -58,11 +61,10 @@ use tokio::fs::create_dir_all;
 /// Simple boxed error type
 type BoxResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-//const CHUNK_SIZE: u64 = 1024 * 1024; // 1MB chunks
 const INTEREST_FILE: &str = "tvshows.list";
 const KV_PATH: &str = ".cache/seen_shows.db";
 const BASE_FOLDER: &str = "/home/stuart/Downloads";
-//const BASE_FOLDER: &str = "/data/videos";
+const CHUNK_SIZE: u64 = 1024 * 1024;
 const BASE_URL: &str = "https://rapidmoviez.com/feature/x265";
 const SHOWS_RSS: &str = "https://rapidmoviez.com/feed/s";
 const MOVIE_RSS: &str = "https://rapidmoviez.com/feed/m";
@@ -81,12 +83,87 @@ const SPECIAL_CASES: &[&str] = &[
 ];
 const LOG_APPENDER_STDOUT: &str = "stdout";
 const LOG_APPENDER_FILE: &str = "file";
-const LOG_PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S)(utc)} {h({l})}: {m}{n}";
+const LOG_PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S)(utc)} {h({l})} {m}{n}";
 
 /// FILETYPES inclusion
 const FILETYPES: &[&str] = &[
     ".mkv", ".mp4", ".avif", ".m4v",
 ];
+
+#[derive(Clone, Debug)]
+struct ProcessEntry {
+    key: String,
+    title: String,
+    rerun: bool,
+    show_name: String,
+    folder: String,
+    sanitized_name: String,
+    pub extention: String,
+    pub link: String,    // RM page
+    pub nf_view: String, // NF view -> file_id
+    pub file_id: String, // NF file details (supports multiple file_id)
+    pub nf_down: String, // NF downloadable by file_id (singular)
+}
+
+struct Aria2cRerun {
+    store: PathBuf,
+    file: File,
+    commands: Vec<String>,
+}
+
+impl Aria2cRerun {
+
+    fn init(filename: String) -> BoxResult<Self> {
+        let store = filename.into();
+        let file = OpenOptions::new()
+            .append(true)
+            .write(true)
+            .create(true)
+            .open(&store)?;
+        let commands: Vec<String> = Vec::new();
+
+        let ret = Self {
+            store,
+            file,
+            commands,
+        };
+        Ok(ret)
+    }
+
+    fn load_list(&mut self) -> BoxResult<()> {
+        // Ensure file exists
+        let file_for_read = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&self.store)?;
+
+        let reader = BufReader::new(file_for_read);
+
+        // Load existing entries
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() || line.starts_with("#") {
+                continue;
+            }
+            self.commands.push(line.clone());
+        }
+
+        Ok(())
+    }
+
+    fn write_rerun(&mut self, command: String) -> BoxResult<()> {
+        if self.commands.contains(&command.clone()) {
+            return Ok(());
+        }
+        writeln!(self.file, "{}", command.clone())?;
+        self.file.flush()?;
+        self.commands.push(command.clone());
+        Ok(())
+    }
+
+}
+
 
 struct Aria2cResult {
     good: bool,
@@ -194,38 +271,19 @@ struct FeedItem {
     source: Source,
 }
 
-#[derive(Clone, Debug)]
-struct ProcessEntry {
-    key: String,
-    title: String,
-    show_name: String,
-    folder: String,
-    sanitized_name: String,
-    pub extention: String,
-    pub link: String,    // RM page
-    pub nf_view: String, // NF view -> file_id
-    pub file_id: String, // NF file details (supports multiple file_id)
-    pub nf_down: String, // NF downloadable by file_id (singular)
-}
-
 struct SceneDown {
     client: Client,
     ux: String,
     px: String,
-    pub download_folder: String,
-    pub ntf_keyinfo: String,
-    pub ntf_fileinfo: String,
     pub ntf_download_link: String,
     max_retries: u32,
 }
 
 impl SceneDown {
 
-    fn init(ux: &str, px: &str, download_folder: &str) -> BoxResult<Self> {
+    fn init(ux: &str, px: &str) -> BoxResult<Self> {
 
         const NTFURL_API: &str = "https://nitroflare.com/api/v2";
-        let ntf_keyinfo: String = format!("{NTFURL_API}/getKeyInfo");
-        let ntf_fileinfo: String = format!("{NTFURL_API}/getFileInfo");
         let ntf_download_link: String = format!("{NTFURL_API}/getDownloadLink");
         let agent = user_agent();
         let client = Client::builder()
@@ -237,9 +295,6 @@ impl SceneDown {
             client,
             ux: ux.to_string().clone(),
             px: px.to_string().clone(),
-            download_folder: download_folder.to_string().clone(),
-            ntf_keyinfo: ntf_keyinfo.clone(),
-            ntf_fileinfo: ntf_fileinfo.clone(),
             ntf_download_link: ntf_download_link.clone(),
             max_retries: 3
         })
@@ -317,6 +372,8 @@ impl SceneDown {
     }
 
     /// Optional: sanity-check premium key once, similar to your KEYINFO call
+    /// overhead - not needed
+    /*
     async fn check_premium(&self) -> BoxResult<()> {
 
         let params = self.premium_params();
@@ -330,6 +387,7 @@ impl SceneDown {
         }
         Err(format!("Nitroflare keyinfo reported error: {:?}", j).into())
     }
+    */
 
     ///
     /// `files` is Vec of (Vec<uri>, tag)
@@ -424,7 +482,7 @@ fn extract_show_from_key(key: &str, re: &Regex) -> String {
     normalize_show_name(key)
 }
 
-/// -------------------- Load shows of interest --------------------
+/// shows of interest from tvshows.list
 fn load_interest_list(path: &str) -> BoxResult<HashSet<String>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -480,22 +538,23 @@ async fn main() -> BoxResult<()> {
     let sdx = SceneDown::init(
         ux.clone().as_str(),
         getenv("NTFLR_PREMIUM", "").as_str(),
-        getenv("VIDEO_DOWNLOAD_DIR", "/data/videos").as_str(),
     ).unwrap();
 
-    // Check premium key once, with retries
-    //sdx.check_premium().await?;
+    let mut urls: Vec<String> = Vec::new();
 
-    // Generate HTML page URLs
-    // 31 first outing of the day, 1AM, else 11 pages
-    let pages: i32 = if h.hour()==1 {31} else {11};
-    let mut urls: Vec<String> = build_urls(BASE_URL, pages);
-
-    // Optional: seed with user-specified URL from command line
+    // seed urls with user-specified from command line
     if let Some(arg_url) = env::args().nth(1) {
         if arg_url.starts_with("http://") || arg_url.starts_with("https://") {
             urls.push(arg_url);
         }
+    }
+
+    // if we don't have a url we synthesize
+    if urls.is_empty() {
+        // Generate HTML page URLs
+        // 21 first outing of the day, 1AM, else 8 pages
+        let pages: i32 = if h.hour()==1 {21} else {8};
+        urls = build_urls(BASE_URL, pages);
     }
 
     if urls.is_empty() {
@@ -523,7 +582,7 @@ async fn main() -> BoxResult<()> {
         let key: &str = "";
 
         async move {
-            match process_page_with_retries(&client, &selector, &url, MAX_RETRIES, false, key).await {
+            match process_page_with_retries(&client, &selector, &url, MAX_RETRIES, false, key, false).await {
                 Ok(links) => {
                     if !links.is_empty() {
                         info!("Found {:>2} links for {}", links.len(), url);
@@ -645,7 +704,51 @@ async fn main() -> BoxResult<()> {
     // Process list: key -> ProcessEntry
     let mut process_map: HashMap<String, ProcessEntry> = HashMap::new();
 
-    info!("Evaluating links");
+    // load re-run list
+    let mut arr = Aria2cRerun::init("aria_rerun.list".to_string()).unwrap();
+    arr.load_list()?;
+
+    let mut work_done = false;
+    for cmd in arr.commands {
+
+        // decompose the commmand to put it back on the queue
+        let chunks: Vec<&str> = cmd.split(' ').collect();
+        work_done = true;
+  
+        let link = chunks[chunks.len()-1];
+        let folder_name = chunks[2];
+        let sanitized_name = chunks[4].to_string();
+        let ext = if sanitized_name.to_string().ends_with(".mkv"){".mkv"}else{".mp4"};
+        let show_name = sanitized_name.to_string().replace(ext,"").replace(".", " ");
+  
+        let rerun = true;
+        let core = extract_title_core(show_name.as_str());
+        let sanitized_name = initcap_string(core.clone().replace(' ',".").as_str());
+        let key = sanitize_show(&core, &re_se);
+        let show_name_norm = extract_show_from_key(&key, &re_se);
+
+        info!("{key} -> moved to [re]process...");
+        process_map.insert(
+            key.clone(),
+            ProcessEntry {
+                key: key.clone().to_string(),
+                rerun,
+                title: show_name,
+                show_name: show_name_norm.to_string(),
+                folder: folder_name.to_string(),
+                sanitized_name: sanitized_name.to_string(),
+                extention: ext.to_string(),
+                link: link.to_string(),
+                file_id: String::new(),
+                nf_view: String::new(),
+                nf_down: link.to_string(),
+            },
+        );
+
+    }
+
+    info!("Interested in {} shows.",interest.len());
+    info!("Evaluating links...");
 
     for item in channel.items() {
         let raw_title = match item.title() {
@@ -668,7 +771,7 @@ async fn main() -> BoxResult<()> {
         );
         let sanitized_name = initcap_string(core.clone().replace(' ',".").as_str());
         
-        //println!("[test] {key}");
+        // info!("[test] {key}");
         if !interest.contains(&show_name_norm) {
             continue;
         }
@@ -684,11 +787,13 @@ async fn main() -> BoxResult<()> {
         }
 
         info!("{key} -> moved to process...");
+        let rerun = false;
         // we can process further
         process_map.insert(
             key.clone(),
             ProcessEntry {
                 key,
+                rerun,
                 title: raw_title,
                 show_name: show_name_norm,
                 folder: folder_name,
@@ -717,12 +822,21 @@ async fn main() -> BoxResult<()> {
     let streamnf = stream::iter(process_map.keys().into_iter().map(|entry| {
 
         // get the link for the entry
-        let url = process_map.get(entry).unwrap().link.clone();
+        let p = process_map.get(entry).unwrap();
+        let url = p.link.clone();
+        let rerun = p.rerun;
         let client = client.clone();
         let selector = selector.clone();
 
         async move {
-            match process_page_with_retries(&client, &selector, &url, MAX_RETRIES, true, entry.clone().as_str()).await {
+            match process_page_with_retries(
+                &client, 
+                &selector, 
+                &url, 
+                MAX_RETRIES, true, 
+                entry.clone().as_str(),
+                rerun).await 
+            {
                 Ok(links) => {
                     links
                 }
@@ -734,18 +848,22 @@ async fn main() -> BoxResult<()> {
     }))
     .buffer_unordered(MAX_CONCURRENCY);
 
-    let mut work_done = false;
     // assemble the NF links we digested
     let mut pm = process_map.clone();
     tokio::pin!(streamnf);
     while let Some(links) = streamnf.next().await {
         for (key, href) in links {
-            let mut temp: Vec<&str> = href.split('.').collect();
-            let ext = temp[temp.len()-1];
-            temp = href.split('/').collect();
-            let file_id = temp[4];
             if pm.contains_key(key.as_str()) {
                 let p = pm.get_mut(key.as_str()).unwrap();
+                let p = pm.get_mut(key.as_str()).unwrap();
+                if p.rerun {
+                    work_done = true;
+                    continue;
+                }
+                let mut temp: Vec<&str> = href.split('.').collect();
+                let ext = temp[temp.len()-1];
+                temp = href.split('/').collect();
+                let file_id = temp[4];
                 p.nf_view = href.clone();
                 p.extention = format!(".{}", ext.to_string());
                 p.file_id = file_id.to_string();
@@ -759,20 +877,19 @@ async fn main() -> BoxResult<()> {
         }
     }
 
-    // debug - take care of this
-    //println!("{} -> {:#?}", work_done, pm);
-
     if work_done {
 
-        // preflight: ensure aria2c exists
-        ensure_aria2c("aria2c").await?;
+        // pre-flight: ensure aria2c exists
+        // this is just noise so parking the call
+        //ensure_aria2c("aria2c").await?;
 
         let streamnf = stream::iter(process_map.keys().into_iter().map(|entry| {
 
             let p = pm.get(entry.as_str()).unwrap();
+            let mut arr = Aria2cRerun::init("aria_rerun.list".to_string()).unwrap();
 
             async move {
-                match aria2c_download(p).await {
+                match aria2c_download(p, &mut arr).await {
                     Ok(good) => {
                         if good.good {
                             good.key.clone()
@@ -793,33 +910,29 @@ async fn main() -> BoxResult<()> {
         tokio::pin!(streamnf);
         while let Some(ret) = streamnf.next().await {
             if !ret.is_empty() {
-                let _ = kv.insert(ret.clone().as_str(), ts.clone().as_str());
-                info!("{} closing out...", ret.clone());
+                let p = pm.get(ret.as_str()).unwrap();
+                if !p.rerun {
+                    let _ = kv.insert(ret.clone().as_str(), ts.clone().as_str());
+                    info!("{} closing out...", ret.clone());
+                }
             }
         }
 
+    } else {
+        warn!("work was not performed, maybe try again");
     }
 
     Ok(())
 
 }
 
-async fn ensure_aria2c(path: &str) -> Result<()> {
-    let mut cmd = Command::new(path);
-    cmd.arg("--version");
-    let status = cmd.status().await;
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        _ => anyhow::bail!("aria2c not found or not executable at '{}'", path),
-    }
-}
-
-async fn aria2c_download(pe: &ProcessEntry) -> BoxResult<Aria2cResult> {
+async fn aria2c_download(pe: &ProcessEntry, arr: &mut Aria2cRerun) -> BoxResult<Aria2cResult> {
 
     let mut ret = Aria2cResult::init(pe.key.clone()).unwrap();
     // Try to detect filename before handing to aria2c
     let aria2c_path = "aria2c";
     let filename = format!("{}{}", pe.sanitized_name, pe.extention);
+    let rerun = pe.rerun;
 
     fs::create_dir_all(pe.folder.clone())?;
 
@@ -832,20 +945,28 @@ async fn aria2c_download(pe: &ProcessEntry) -> BoxResult<Aria2cResult> {
         "--quiet".into(),
         "--max-connection-per-server=16".into(),
         "--max-concurrent-downloads=16".into(),
-        "--split=8".into(),
+        "--split=20".into(),
         "--continue=true".into(),
         "--auto-file-renaming=true".into(),
         "--summary-interval=0".into(),
-        /////"--allow-overwrite=true".into(),
+        "--allow-overwrite=true".into(),
     ];
     args.push(pe.nf_down.clone().into());
 
     // these we just need to fire and forget
-    info!("[aria2c] {} {}", aria2c_path, args.join(" "));
+    let command = format!("{} {}", aria2c_path, args.join(" "));
+    info!("[aria2c] {}", command.clone());
     let status = Command::new(aria2c_path).args(&args).status().await?;
+    info!("[aria2c] {} {}", status, status.success());
+
     if !status.success() {
-        error!("aria2c failed with status {status}");
-        ret.good = false;
+        error!("aria2c failed -> {status}");
+        if !rerun {
+            arr.write_rerun(command.clone())?;
+        }
+        ret.good = true; // added to rerun (so rerun is consumed and not picked up from the scrape), and we close out
+    }else{
+        ret.good = true; // close out
     }
 
     Ok(ret)
@@ -915,10 +1036,15 @@ async fn process_page_with_retries(
     max_retries: u32,
     use_sse: bool,
     key: &str,
+    rerun: bool,
 ) -> BoxResult<Vec<(String, String)>> {
 
-    let mut attempt: u32 = 0;
+    if rerun {
+        let res: Vec<(String, String)> = Vec::new();
+        return Ok(res);
+    }
 
+    let mut attempt: u32 = 0;
     loop {
         attempt += 1;
         match process_page(client, selector, url, use_sse, key).await {
@@ -1224,185 +1350,43 @@ fn sanitize_show(data: &str, re: &Regex) -> String {
     test
 }
 
-/*
-fn is_year_token(tok: &str) -> bool {
-    if tok.len() == 4 && tok.chars().all(|c| c.is_ascii_digit()) {
-        if let Ok(y) = tok.parse::<u32>() {
-            return (1900..=2100).contains(&y);
-        }
-    }
-    false
-}
+async fn get_chunked(pe: &ProcessEntry) -> BoxResult<Aria2cResult> {
 
-fn is_bad_token(tok: &str, bad_tokens: &[String]) -> bool {
-    let t = tok.to_ascii_lowercase();
+    let key = pe.key.clone();
+    info!("{}", key.clone());
+    let mut ret = Aria2cResult::init(key.clone()).unwrap();
+    let url = pe.nf_down.clone();
+    let output_path = format!("{}/Ck_{}{}", pe.folder, pe.sanitized_name, pe.extention);
+    let rerun = pe.rerun;
 
-    if bad_tokens
-        .iter()
-        .any(|b| t == *b || t.starts_with(b) || b.starts_with(&t))
-    {
-        return true;
-    }
-
-    if t.chars().all(|c| c.is_ascii_digit()) && t.len() >= 3 && !is_year_token(&t) {
-        return true;
-    }
-
-    false
-}
-
-fn title_matches_interest(title: &str, interest_list: &[String]) -> bool {
-    let title_lower = title.to_ascii_lowercase();
-    interest_list.iter().any(|needle| title_lower.contains(needle))
-}
-
-fn sanitize_title(title: &str, bad_tokens: &[String]) -> String {
-    let mut s = title.to_ascii_lowercase();
-    s = s.replace('.', " ").replace('_', " ");
-
-    s = strip_bracketed(&s, '(', ')');
-    s = strip_bracketed(&s, '[', ']');
-
-    if let Some(idx) = s.rfind(" - ") {
-        s.truncate(idx);
-    }
-
-    let mut kept: Vec<String> = Vec::new();
-
-    for tok in s.split_whitespace() {
-        let tok = tok.trim();
-        if tok.is_empty() {
-            continue;
-        }
-
-        if is_season_episode_token(tok) {
-            kept.push(tok.to_string());
-            continue;
-        }
-
-        if is_year_token(tok) {
-            kept.push(tok.to_string());
-            continue;
-        }
-
-        if is_bad_token(tok, bad_tokens) {
-            break; // we hit a garbage word - done
-        }
-
-        kept.push(tok.to_string());
-    }
-
-    let normalized = kept.join(" ");
-    normalized.trim().to_string()
-
-}
-
-fn strip_bracketed(s: &str, open: char, close: char) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut depth = 0usize;
-
-    for ch in s.chars() {
-        if ch == open {
-            depth += 1;
-            continue;
-        } else if ch == close {
-            if depth > 0 {
-                depth -= 1;
-                continue;
-            }
-        }
-
-        if depth == 0 {
-            out.push(ch);
-        }
-    }
-
-    out
-}
-
-fn is_season_episode_token(tok: &str) -> bool {
-    let t = tok.to_ascii_lowercase();
-    let bytes = t.as_bytes();
-
-    // s\d+e\d+
-    if bytes.len() >= 4 && bytes[0] == b's' {
-        let mut i = 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'e' {
-            i += 1;
-            let start_e = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i == bytes.len() && i > start_e {
-                return true;
-            }
-        }
-    }
-
-    // \d+x\d+
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i > 0 && i + 2 <= bytes.len() && bytes[i] == b'x' {
-        let mut j = i + 1;
-        let start2 = j;
-        while j < bytes.len() && bytes[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j == bytes.len() && j > start2 {
-            return true;
-        }
-    }
-
-    false
-}
-*/
-
-fn getenv(key: &str, defo: &str) -> String {
-    match env::var(key) {
-        Ok(val) => val,
-        Err(_e) => defo.to_string().clone()
-    }
-}
-
-/*
-async fn getchunked(sxd: SceneDown, entry: ProcessData) -> Result<(), Box<dyn std::error::Error>> {
-
-    let url = entry.link
-    let output_path = [sxd.folder, entry.folder, entry.sanitized_name].join('/');
-    let num_parallel_chunks = 8;
-
+    fs::create_dir_all(pe.folder.clone())?;
     let client = Client::new();
 
-    // 1. Get file size and check for range support
-    let response = client.head(url).send().await?;
+    // Get file size and check for range support
+    // implement retries for this
+    let response = client.head(url.clone()).send().await?;
     let content_length = response
         .headers()
-        .get("content-length")
+        .get(CONTENT_LENGTH)
         .and_then(|l| l.to_str().ok())
         .and_then(|l| l.parse::<u64>().ok())
-        .ok_or("Failed to get content-length")?;
+        .ok_or("Failed to get {CONTENT_LENGTH}")?;
 
+    let mut file = File::create(output_path.clone())?;
     if !response.headers().contains_key("accept-ranges") {
-        eprintln!("Warning: Server does not support range requests. Downloading sequentially.");
+        warn!("Warning: Server does not support range requests. Downloading sequentially.");
         // Fallback to sequential download if range requests are not supported
-        let mut file = File::create(output_path).await?;
-        let mut response = client.get(url).send().await?.error_for_status()?;
+        let mut response = client.get(url.clone()).send().await?.error_for_status()?;
         while let Some(chunk) = response.chunk().await? {
-            file.write_all(&chunk).await?;
+            file.write_all(&chunk)?;
         }
-        return Ok(());
+        return Ok(ret);
     }
 
-    // 2. Create the output file and pre-allocate space
-    let mut file = File::create(output_path).await?;
-    file.set_len(content_length).await?;
+    // 2. Range supported, pre-allocate space
+    file.set_len(content_length)?;
 
-    // 3. Determine chunk ranges
+    // Determine chunk ranges
     let mut chunk_ranges: Vec<Range<u64>> = Vec::new();
     let mut start = 0;
     while start < content_length {
@@ -1411,39 +1395,55 @@ async fn getchunked(sxd: SceneDown, entry: ProcessData) -> Result<(), Box<dyn st
         start += CHUNK_SIZE;
     }
 
-    // 4. Download chunks in parallel
+    info!("<<< {output_path} {content_length}bytes {}chunks", chunk_ranges.len());
+    //let mut done = 0;
+    // Download chunks in parallel
     let mut tasks = Vec::new();
     for (i, range) in chunk_ranges.into_iter().enumerate() {
         let client = client.clone(); // Clone client for each task
         let output_path = output_path.to_string();
-        let task = tokio::spawn(async move {
-            let mut file = File::options().write(true).open(&output_path).await?;
-            let range_header = format!("bytes={}-{}", range.start, range.end - 1);
-            println!("Downloading chunk {} (Range: {})", i, range_header);
+        let url = url.clone();
+        let task = tokio::spawn(
+            async move {
 
-            let response = client.get(url)
-                .header("Range", range_header)
-                .send()
-                .await?
-                .error_for_status()?;
+                let mut file = File::options().write(true).open(&output_path)?;
+                let range_header = format!("bytes={}-{}", range.start, range.end - 1);
+                // implement retries for this
+                let response = client.get(url.clone())
+                    .header(RANGE, range_header)
+                    .send()
+                    .await?
+                    .error_for_status()?;
 
-            file.seek(std::io::SeekFrom::Start(range.start)).await?;
-            let mut bytes = response.bytes().await?;
-            file.write_all(&bytes).await?;
-            println!("Finished chunk {}", i);
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        });
+                file.seek(std::io::SeekFrom::Start(range.start))?;
+                let mut bytes = response.bytes().await?;
+                file.write_all(&bytes)?;
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+
+            }
+        );
+
         tasks.push(task);
+
     }
 
     // Wait for all tasks to complete
     join_all(tasks).await;
 
-    println!("File downloaded successfully to {}", output_path);
+    info!(">>> {output_path}");
 
-    Ok(())
+    ret.good = true;
+    Ok(ret)
+
 }
-*/
+
+fn getenv(key: &str, defo: &str) -> String {
+    match env::var(key) {
+        Ok(val) => val,
+        Err(_e) => defo.to_string().clone()
+    }
+}
+
 
 /*
 
