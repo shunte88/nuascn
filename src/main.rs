@@ -24,7 +24,7 @@
 #[allow(dead_code)]
 #[allow(unused_imports)]
 use anyhow::{Context, Result};
-use log::{info, error, warn, LevelFilter};
+use log::{info, error, warn, debug, LevelFilter};
 use log4rs::append::console::ConsoleAppender;
 use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Config, Root};
@@ -35,6 +35,7 @@ use std::{
     env, 
     error::Error,
     fs, 
+    io,
     fs::{File, OpenOptions}, 
     io::{BufRead, BufReader, Cursor, Write},
     path::{Path, PathBuf}, 
@@ -63,7 +64,8 @@ type BoxResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const INTEREST_FILE: &str = "tvshows.list";
 const KV_PATH: &str = ".cache/seen_shows.db";
-const BASE_FOLDER: &str = "/home/stuart/Downloads";
+const BASE_FOLDER: &str = "/data/videos";
+const DOWNLOAD_FOLDER: &str = "/home/stuart/Downloads";
 const CHUNK_SIZE: u64 = 1024 * 1024;
 const BASE_URL: &str = "https://rapidmoviez.com/feature/x265";
 const SHOWS_RSS: &str = "https://rapidmoviez.com/feed/s";
@@ -90,6 +92,7 @@ const FILETYPES: &[&str] = &[
     ".mkv", ".mp4", ".avif", ".m4v",
 ];
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct ProcessEntry {
     key: String,
@@ -164,9 +167,9 @@ impl Aria2cRerun {
 
 }
 
-
 struct Aria2cResult {
     good: bool,
+    success: bool,
     key: String,
 }
 
@@ -174,13 +177,16 @@ impl Aria2cResult {
 
     fn init(key: String) -> BoxResult<Self> {
         let good = false;
+        let success = false;
         Ok(Self {
             good,
+            success,
             key
         })
     }
 }
 
+#[allow(dead_code)]
 struct KvStore {
     store: PathBuf,
     map: HashMap<String, String>,
@@ -623,7 +629,7 @@ async fn main() -> BoxResult<()> {
         }
     }
 
-    // ---- Process RSS feeds with same retry + link_matches ----
+    // Process the RSS feeds with same retry + link_matches
     let rss_sources = &[(SHOWS_RSS, Source::RssShows), (MOVIE_RSS, Source::RssMovies)];
 
     for (rss_url, src) in rss_sources {
@@ -766,12 +772,11 @@ async fn main() -> BoxResult<()> {
         let show_name_norm = extract_show_from_key(&key, &re_se);
         let folder_name = format!(
             "{}/{}", 
-            BASE_FOLDER, 
+            DOWNLOAD_FOLDER, 
             initcap_string(show_name_norm.clone().as_str())
         );
         let sanitized_name = initcap_string(core.clone().replace(' ',".").as_str());
         
-        // info!("[test] {key}");
         if !interest.contains(&show_name_norm) {
             continue;
         }
@@ -891,14 +896,10 @@ async fn main() -> BoxResult<()> {
             async move {
                 match aria2c_download(p, &mut arr).await {
                     Ok(good) => {
-                        if good.good {
-                            good.key.clone()
-                        } else {
-                            String::new()
-                        }
+                        good
                     }
                     Err(_e) => {
-                        String::new()
+                        Aria2cResult::init("".to_string()).unwrap()
                     }
                 }
             }
@@ -909,11 +910,14 @@ async fn main() -> BoxResult<()> {
         let ts = now.format("%Y-%m-%dT%H:%M:%S%z").to_string();
         tokio::pin!(streamnf);
         while let Some(ret) = streamnf.next().await {
-            if !ret.is_empty() {
-                let p = pm.get(ret.as_str()).unwrap();
+            if !ret.key.is_empty() {
+                let p = pm.get(ret.key.clone().as_str()).unwrap();
                 if !p.rerun {
-                    let _ = kv.insert(ret.clone().as_str(), ts.clone().as_str());
-                    info!("{} closing out...", ret.clone());
+                    let _ = kv.insert(ret.key.clone().as_str(), ts.clone().as_str());
+                    info!("{} closing out...", ret.key.clone());
+                }
+                if ret.success {
+                    let _ = move_file(p).await?;
                 }
             }
         }
@@ -924,6 +928,33 @@ async fn main() -> BoxResult<()> {
 
     Ok(())
 
+}
+
+async fn move_file(pe: &ProcessEntry) -> io::Result<()> {
+
+    let source_file = PathBuf::from(format!("{}/{}{}",pe.folder.clone(),pe.sanitized_name,pe.extention));
+    let destination_dir = PathBuf::from(BASE_FOLDER);
+    let destination_file = PathBuf::from(format!("{}/{}{}", BASE_FOLDER,pe.sanitized_name,pe.extention));
+    fs::create_dir_all(&destination_dir)?;
+    info!("{} -> {}", source_file.display(), destination_file.display());
+    if let Err(e) = fs::rename(&source_file, &destination_file) {
+
+        if e.kind() == io::ErrorKind::CrossesDevices {
+            error!(
+                "Attempting to move file across devices: '{}' to '{}'. Performing copy and delete.",
+                source_file.display(),
+                destination_file.display()
+            );
+            fs::copy(source_file.clone(), destination_file.clone())?; // Copy the file
+            fs::remove_file(source_file.clone())?; // Delete the original file
+            Ok(())
+        } else {
+            // Re-raise other errors
+            Err(e)
+        }
+    } else {
+        Ok(()) // Rename succeeded
+    }
 }
 
 async fn aria2c_download(pe: &ProcessEntry, arr: &mut Aria2cRerun) -> BoxResult<Aria2cResult> {
@@ -955,9 +986,11 @@ async fn aria2c_download(pe: &ProcessEntry, arr: &mut Aria2cRerun) -> BoxResult<
 
     // these we just need to fire and forget
     let command = format!("{} {}", aria2c_path, args.join(" "));
-    info!("[aria2c] {}", command.clone());
+    debug!("[aria2c] {}", command.clone());
     let status = Command::new(aria2c_path).args(&args).status().await?;
-    info!("[aria2c] {} {}", status, status.success());
+    debug!("[aria2c] {} {}", status, status.success());
+
+    ret.success = status.success();
 
     if !status.success() {
         error!("aria2c failed -> {status}");
