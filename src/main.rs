@@ -44,6 +44,8 @@ use std::{
 use futures::future::join_all;
 use chrono::{DateTime, FixedOffset, Utc, Local};
 use chrono::Timelike;
+use fs_extra::file::CopyOptions;
+use fs_extra::file::move_file as fs_move_file;
 
 use std::io::Seek;
 use std::ops::Range;
@@ -81,7 +83,8 @@ const VIDEO_RESOLUTION_2160: &str = "2160ZZZ";  // munged
 const SPECIAL_CASES: &[&str] = &[
     "USA","FBI","BBC","US","AU","PL","IE","NZ","FR","DE","JP","UK",
     "QI","XL","SAS","RAF","WWII","WPC","LOL","VI","VII","VIII","VIIII","IX","II","III","IV",
-    "DCI","HD","W1A","HBO","100K"
+    "DCI","HD","W1A","HBO","100K",
+    "DC","DP", "X-MAS",
 ];
 const LOG_APPENDER_STDOUT: &str = "stdout";
 const LOG_APPENDER_FILE: &str = "file";
@@ -255,6 +258,7 @@ impl KvStore {
 #[derive(Clone, Copy, Debug)]
 enum Source {
     Html,
+    HtmlMulti,
     RssShows,
     RssMovies,
 }
@@ -262,7 +266,8 @@ enum Source {
 impl Source {
     fn tag(&self) -> &'static str {
         match self {
-            Source::Html => "HTML",
+            Source::Html => "HTML-SINGLE",
+            Source::HtmlMulti => "HTML-MULTI",
             Source::RssShows => "RSS-SHOW",
             Source::RssMovies => "RSS-MOVIE",
         }
@@ -277,6 +282,7 @@ struct FeedItem {
     source: Source,
 }
 
+#[derive(Clone, Debug)]
 struct SceneDown {
     client: Client,
     ux: String,
@@ -375,25 +381,8 @@ impl SceneDown {
             let delay_ms = 500 * attempt as u64;
             sleep(Duration::from_millis(delay_ms)).await;
         }
-    }
 
-    /// Optional: sanity-check premium key once, similar to your KEYINFO call
-    /// overhead - not needed
-    /*
-    async fn check_premium(&self) -> BoxResult<()> {
-
-        let params = self.premium_params();
-        let j = self.get_json_with_retries(self.ntf_keyinfo.clone().as_str(), &params).await?;
-        if let Some(status) = j.get("result")
-            .and_then(|r| r.get("status")
-            .and_then(|s| s.as_str())) {
-            if status.eq_ignore_ascii_case("success")||status.eq_ignore_ascii_case("active") {
-                return Ok(());
-            }
-        }
-        Err(format!("Nitroflare keyinfo reported error: {:?}", j).into())
     }
-    */
 
     ///
     /// `files` is Vec of (Vec<uri>, tag)
@@ -405,29 +394,6 @@ impl SceneDown {
 
         let file_id = pm.file_id.as_str();
         let mut download = String::new();
-
-        /* 
-
-        let _ = self.check_premium().await?;
-
-        // getFileInfo – we mostly use this as a sanity check
-        let mut params = self.premium_params();
-        let params_fileinfo = [("files", file_id)];
-        params.extend_from_slice(&params_fileinfo);
-        let j_fileinfo = self
-            .get_json_with_retries(self.ntf_fileinfo.clone().as_str(), &params)
-            .await?;
-        // result->status
-        if let Some(status) = j_fileinfo.get("type").and_then(|v| v.as_str()) {
-            if !status.eq_ignore_ascii_case("success") {
-                warn!(
-                    "Fileinfo error for file_id={} status='{}' payload={:?}",
-                    file_id, status, j_fileinfo
-                );
-                return Ok(download);
-            }
-        }
-        */
 
         // getDownloadLink
         let mut params_dl = self.premium_params();
@@ -548,10 +514,12 @@ async fn main() -> BoxResult<()> {
 
     let mut urls: Vec<String> = Vec::new();
 
+    let mut single = false;
     // seed urls with user-specified from command line
     if let Some(arg_url) = env::args().nth(1) {
         if arg_url.starts_with("http://") || arg_url.starts_with("https://") {
             urls.push(arg_url);
+            single = true;
         }
     }
 
@@ -578,10 +546,17 @@ async fn main() -> BoxResult<()> {
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()?;
 
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut feed_items: Vec<FeedItem> = Vec::new();
+
+    let now_utc = Utc::now();
+    let now_fixed: DateTime<FixedOffset> = now_utc.into();
+    let pub_date_str = now_fixed.to_rfc2822();
     let selector = Selector::parse("a").expect("Selector parse for <a> should never fail");
 
+    let urls1 = urls.clone();
     // Fetch and process all HTML pages in parallel with bounded concurrency
-    let stream = stream::iter(urls.into_iter().map(|url| {
+    let stream = stream::iter(urls1.into_iter().map(|url| {
 
         let client = client.clone();
         let selector = selector.clone();
@@ -603,9 +578,6 @@ async fn main() -> BoxResult<()> {
     }))
     .buffer_unordered(MAX_CONCURRENCY);
 
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut feed_items: Vec<FeedItem> = Vec::new();
-
     // Collect items from HTML pages
     tokio::pin!(stream);
     while let Some(links) = stream.next().await {
@@ -613,20 +585,57 @@ async fn main() -> BoxResult<()> {
             if !seen.insert(href.clone()) {
                 continue;
             }
-
-            // HTML has no inherent date: fallback to "now"
-            let now_utc = Utc::now();
-            let now_fixed: DateTime<FixedOffset> = now_utc.into();
-            let pub_date_str = now_fixed.to_rfc2822();
-
             feed_items.push(FeedItem {
                 title,
                 link: href,
                 pub_date: now_fixed,
-                pub_date_str,
+                pub_date_str: pub_date_str.clone(),
                 source: Source::Html,
             });
         }
+    }
+
+    // found no links, maybe we were given a page with
+    // multiple links to process? Lets parse for the same
+    if single && feed_items.is_empty() {
+
+        let url = urls[0].clone();
+        let key: &str = "";
+        let selector = Selector::parse("pre.links").expect("valid <pre class=\"links\"> selector");
+
+        match process_page_with_retries(&client, &selector, &url, MAX_RETRIES, true, key, false).await {
+            Ok(links) => {
+                if !links.is_empty() {
+                    let mut hrefs: Vec<(String, String)> = Vec::new();
+                    if links.len() == 1 {
+                        let (_, href) = &links[0];
+                        for link in href.split("\n") {
+                            let title = format!("[NF] {}",link.rsplit('/').next().unwrap_or("").to_string());
+                            let title = title.trim().to_string().replace(".", " ");
+                            //info!("{title} -> {link}");
+                            hrefs.push((title.clone(), link.to_string()));
+                        }
+                    }else{
+                        hrefs.append(links.clone().as_mut());
+                    }
+                    for link in hrefs {
+                        let (title, href) = link;
+                        feed_items.push(FeedItem {
+                            title: title,
+                            link: href,
+                            pub_date: now_fixed,
+                            pub_date_str: pub_date_str.clone(),
+                            source: Source::HtmlMulti,
+                        });
+
+                    }
+                }
+            }
+            Err(e) => {
+                error!("{e}")
+            }
+        }
+
     }
 
     // Process the RSS feeds with same retry + link_matches
@@ -663,13 +672,13 @@ async fn main() -> BoxResult<()> {
     // ---- Normalize & sort chronologically (newest first) ----
     feed_items.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
 
-    // Latest pub_date for channel-level lastBuildDate (if any)
+    // latest pub_date for channel-level lastBuildDate (if any)
     let last_build_date = feed_items
         .first()
         .map(|fi| fi.pub_date_str.clone())
         .unwrap_or_else(|| Utc::now().to_rfc2822());
 
-    // Build RSS items with tagged titles and normalized pubDate
+    // build RSS items with tagged titles and normalized pubDate
     let rss_items: Vec<Item> = feed_items
         .into_iter()
         .map(|fi| {
@@ -682,7 +691,7 @@ async fn main() -> BoxResult<()> {
         })
         .collect();
 
-    // Build RSS channel
+    // build RSS channel
     let channel = ChannelBuilder::default()
         .title("NF Links o'shunte88")
         .link(BASE_URL)
@@ -691,7 +700,7 @@ async fn main() -> BoxResult<()> {
         .items(rss_items)
         .build();
 
-    // Write RSS to file
+    // write RSS to file
     let mut fileo = File::create(OUTPUT_FILE)?;
     fileo.write_all(channel.to_string().as_bytes())?;
 
@@ -701,13 +710,13 @@ async fn main() -> BoxResult<()> {
 
     let re_se = season_episode_regex();
 
-    // Load shows-of-interest
+    // load shows-of-interest
     let interest = load_interest_list(INTEREST_FILE)?;
 
     // lite persistent KV store - yes - a flatfile - sued me
     let mut kv = KvStore::open(KV_PATH)?;
 
-    // Process list: key -> ProcessEntry
+    // process list: key -> ProcessEntry
     let mut process_map: HashMap<String, ProcessEntry> = HashMap::new();
 
     // load re-run list
@@ -822,6 +831,50 @@ async fn main() -> BoxResult<()> {
         return Ok(());
     }
 
+    let mut patch_map: HashMap<String, ProcessEntry> = HashMap::new();
+
+    if single {
+
+        for key in process_map.keys().cloned().into_iter() {
+            // Obtain a snapshot of the entry to check without holding an immutable borrow
+            if let Some(pm) = process_map.get(&key) {
+                if pm.title.contains(Source::HtmlMulti.tag()) {
+                    let link = pm.link.as_str();
+                    let (ext, file_id) = get_attr_file_id(link).unwrap();
+                    let mut nf_down = String::new();
+                    let mut ppp = pm.clone();
+                    ppp.file_id = file_id.to_string();
+                    if !file_id.is_empty() {
+                        nf_down = sdx.get_download(&ppp).await.unwrap();
+                        if !nf_down.is_empty() {
+                            work_done = true;
+                        }
+                    }
+                    patch_map.insert(
+                        key.clone(),
+                        ProcessEntry {
+                            key: key.clone().to_string(),
+                            rerun: false,
+                            title: pm.title.clone(),
+                            show_name: pm.show_name.clone(),
+                            folder: pm.folder.clone(),
+                            sanitized_name: pm.sanitized_name.clone(),
+                            extention: format!(".{}", ext.to_string()),
+                            link: pm.link.clone(),
+                            file_id: file_id.to_string(),
+                            nf_view: link.to_string(),
+                            nf_down,
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    if single && !patch_map.is_empty() {
+        process_map = patch_map;
+    }
+
     let selector = Selector::parse("pre.links").expect("valid <pre class=\"links\"> selector");
     // Fetch and process all HTML pages in parallel with bounded concurrency
     let streamnf = stream::iter(process_map.keys().into_iter().map(|entry| {
@@ -838,7 +891,8 @@ async fn main() -> BoxResult<()> {
                 &client, 
                 &selector, 
                 &url, 
-                MAX_RETRIES, true, 
+                MAX_RETRIES, 
+                true, 
                 entry.clone().as_str(),
                 rerun).await 
             {
@@ -860,20 +914,17 @@ async fn main() -> BoxResult<()> {
         for (key, href) in links {
             if pm.contains_key(key.as_str()) {
                 let p = pm.get_mut(key.as_str()).unwrap();
-                let p = pm.get_mut(key.as_str()).unwrap();
                 if p.rerun {
                     work_done = true;
                     continue;
                 }
-                let mut temp: Vec<&str> = href.split('.').collect();
-                let ext = temp[temp.len()-1];
-                temp = href.split('/').collect();
-                let file_id = temp[4];
+                let link = &href.clone();
+                let (ext, file_id) = get_attr_file_id(link).unwrap();
                 p.nf_view = href.clone();
                 p.extention = format!(".{}", ext.to_string());
                 p.file_id = file_id.to_string();
                 if !p.file_id.is_empty() {
-                    p.nf_down = sdx.get_download(p).await?;
+                    p.nf_down = sdx.get_download(p).await.unwrap();
                     if !p.nf_down.is_empty() {
                         work_done = true;
                     }
@@ -937,24 +988,11 @@ async fn move_file(pe: &ProcessEntry) -> io::Result<()> {
     let destination_file = PathBuf::from(format!("{}/{}{}", BASE_FOLDER,pe.sanitized_name,pe.extention));
     fs::create_dir_all(&destination_dir)?;
     info!("{} -> {}", source_file.display(), destination_file.display());
-    if let Err(e) = fs::rename(&source_file, &destination_file) {
-
-        if e.kind() == io::ErrorKind::CrossesDevices {
-            error!(
-                "Attempting to move file across devices: '{}' to '{}'. Performing copy and delete.",
-                source_file.display(),
-                destination_file.display()
-            );
-            fs::copy(source_file.clone(), destination_file.clone())?; // Copy the file
-            fs::remove_file(source_file.clone())?; // Delete the original file
-            Ok(())
-        } else {
-            // Re-raise other errors
-            Err(e)
-        }
-    } else {
-        Ok(()) // Rename succeeded
+    match fs_move_file(&source_file, &destination_file, &CopyOptions::new()) {
+        Ok(_) => info!("move complete."),
+        Err(e) => eprint!("move exception: {e}"),
     }
+    Ok(())
 }
 
 async fn aria2c_download(pe: &ProcessEntry, arr: &mut Aria2cRerun) -> BoxResult<Aria2cResult> {
@@ -1004,6 +1042,14 @@ async fn aria2c_download(pe: &ProcessEntry, arr: &mut Aria2cRerun) -> BoxResult<
 
     Ok(ret)
 
+}
+
+fn get_attr_file_id(href: &str) -> Result<(&str, &str)> {
+    let temp: Vec<&str> = href.clone().split('.').collect();
+    let ext = temp[temp.len()-1];
+    let temp: Vec<&str> = href.clone().split('/').collect();
+    let file_id = temp[4];
+    Ok((ext, file_id))
 }
 
 fn initcap_string(show: &str) -> String {
@@ -1449,7 +1495,7 @@ async fn get_chunked(pe: &ProcessEntry) -> BoxResult<Aria2cResult> {
                     .error_for_status()?;
 
                 file.seek(std::io::SeekFrom::Start(range.start))?;
-                let mut bytes = response.bytes().await?;
+                let bytes = response.bytes().await?;
                 file.write_all(&bytes)?;
                 Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
 
