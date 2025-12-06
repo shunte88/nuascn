@@ -23,7 +23,7 @@
 
 #[allow(dead_code)]
 #[allow(unused_imports)]
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::{info, error, warn, debug, LevelFilter};
 use log4rs::append::console::ConsoleAppender;
 use log4rs::append::file::FileAppender;
@@ -50,7 +50,7 @@ use fs_extra::file::move_file as fs_move_file;
 use std::io::Seek;
 use std::ops::Range;
 use futures::{stream, StreamExt};
-use reqwest::{Client, StatusCode};
+use reqwest::{Proxy, Client, ClientBuilder, StatusCode};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, RANGE};
 use rss::{Channel, ChannelBuilder, Item, ItemBuilder};
 use scraper::{Html, Selector};
@@ -58,8 +58,17 @@ use tokio::time::{error::Elapsed, sleep};
 use url::Url;
 use regex::Regex;
 use serde_json::Value;
-use tokio::{process::Command, sync::mpsc};
+use tokio::{process::Command, process::Child, sync::mpsc};
 use tokio::fs::create_dir_all;
+use tokio::net::TcpStream;
+use std::thread;
+use std::process::{Stdio};
+use bytes::Bytes;
+
+use hyper::{body::Incoming, Request};
+use hyper::client::conn::http1::Builder as HyperBuilder;
+use hyper_util::client::legacy::Client as LegacyClient;
+use http_body_util::Empty;
 
 /// Simple boxed error type
 type BoxResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -169,6 +178,130 @@ impl Aria2cRerun {
     }
 
 }
+
+struct TorManager {
+    addr: String,
+    child: Option<tokio::process::Child>,
+    proxy_str: String,
+}
+
+impl TorManager {
+    async fn start() -> BoxResult<Self> {
+
+        let port: u16 = 9050;
+        let data_dir: PathBuf = "/data2/nuascn/.cache/tor_/".into();
+        let config_dir: PathBuf = "/etc/tor/torrc".into();
+        fs::create_dir_all(&data_dir)?;
+        let addr = format!("localhost:{port}");
+        let proxy_str = format!("socks5h://{}", addr.clone());
+    /*
+        // spawn tor
+        let program = "/usr/sbin/tor";
+
+        let mut args: Vec<String> = vec![
+            "-f".into(),
+            config_dir.to_string_lossy().to_string().clone().into(),
+            "--SOCKSPort".into(),
+            addr.clone(),
+            "--RunAsDaemon 1".into(),
+        ];
+
+        // these we just need to fire and forget
+        let command = format!("{} {}", program.clone(), args.join(" "));
+        info!("[tor] {}", command.clone());
+        let cmd = tokio::process::Command::new(program.clone())
+            .args(&args)
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())       
+            .spawn()
+            .expect("failed to start tor process");
+
+        info!("[tor] {:#?}", cmd);
+        let mut ready = false;
+        for _ in 0..60 {
+            match TcpStream::connect(&addr.clone()).await {
+                Ok(_) => {
+                    ready = true;
+                    break;
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+
+        if !ready {
+            // if you prefer to hard-fail instead of warning, return Err here
+            warn!(
+                "Tor SOCKS port {} not reachable after waiting; \
+                 continuing but HTTP calls may fail.",
+                addr
+            );
+        } else {
+            info!("Tor SOCKS port {} is up; routing HTTP via Tor.", addr.clone());
+        }
+*/
+        Ok(Self {
+            addr,
+            child: None,
+            proxy_str,
+        })
+
+    }
+
+        pub async fn assert_tor_running(&self) -> Result<()> {
+        // Make sure you are running tor and this is your socks port
+        let proxy = reqwest::Proxy::all(self.proxy_str.clone())
+            .context("Failed to construct Tor proxy URL")?;
+        let client = reqwest::Client::builder().proxy(proxy).build()?;
+
+        let res = client.get("https://check.torproject.org").send().await?;
+        let text = res.text().await?;
+
+        if !text.contains("Congratulations. This browser is configured to use Tor.") {
+            bail!("Tor is currently not running")
+        }
+
+        Ok(())
+    }
+
+    /*
+    fn apply_to_builder(
+        &self,
+        builder: ClientBuilder,
+    ) -> BoxResult<ClientBuilder> {
+        if let Some(ref p) = self.proxy_str {
+            let builder = builder.proxy(Proxy::all(p)?);
+            Ok(builder)
+        } else {
+            Ok(builder)
+        }
+    }
+
+    fn aria2_proxy_args(&self) -> Vec<String> {
+        match &self.proxy_str {
+            Some(p) => vec!["--all-proxy".into(), p.clone()],
+            None => Vec::new(),
+        }
+    }
+    */
+
+    fn proxy_str(&self) -> String {
+        self.proxy_str.clone()
+    }
+
+}
+
+// redundant - we setup auto drop & kill
+// can't hurt though
+impl Drop for TorManager {
+    fn drop(&mut self) {
+        //let _ = Some(self.child).kill();
+    }
+}
+
+#[derive(Clone, Debug)]
 
 struct Aria2cResult {
     good: bool,
@@ -293,13 +426,18 @@ struct SceneDown {
 
 impl SceneDown {
 
-    fn init(ux: &str, px: &str) -> BoxResult<Self> {
+    fn init(
+        ux: &str, 
+        px: &str,
+        proxy: &str
+    ) -> BoxResult<Self> {
 
         const NTFURL_API: &str = "https://nitroflare.com/api/v2";
         let ntf_download_link: String = format!("{NTFURL_API}/getDownloadLink");
         let agent = user_agent();
         let client = Client::builder()
             .user_agent(agent)
+            .proxy(Proxy::all(proxy)?)
             .timeout(Duration::from_secs(20))
             .build()?;
 
@@ -496,7 +634,7 @@ async fn main() -> BoxResult<()> {
             Root::builder()
                 .appender(LOG_APPENDER_STDOUT)
                 .appender(LOG_APPENDER_FILE)
-                .build(LevelFilter::Info),
+                .build(LevelFilter::Info), //Info
         )
         .unwrap();
     log4rs::init_config(config).unwrap();
@@ -507,9 +645,15 @@ async fn main() -> BoxResult<()> {
         return Ok(());
     }
 
+    // note we are assuming the tor service has control here
+    let tunnel = TorManager::start().await?;
+    let proxy_str = tunnel.proxy_str();
+    //tunnel.assert_tor_running().await?;
+
     let sdx = SceneDown::init(
         ux.clone().as_str(),
         getenv("NTFLR_PREMIUM", "").as_str(),
+        proxy_str.as_str(),
     ).unwrap();
 
     let mut urls: Vec<String> = Vec::new();
@@ -527,7 +671,7 @@ async fn main() -> BoxResult<()> {
     if urls.is_empty() {
         // Generate HTML page URLs
         // 21 first outing of the day, 1AM, else 8 pages
-        let pages: i32 = if h.hour()==1 {21} else {8};
+        let pages: i32 = if h.hour()%2==0 {21} else {8};
         urls = build_urls(BASE_URL, pages);
     }
 
@@ -541,6 +685,7 @@ async fn main() -> BoxResult<()> {
     let agent = user_agent();
     let client = Client::builder()
         .user_agent(agent)
+        .proxy(Proxy::all(proxy_str.clone())?)
         .danger_accept_invalid_certs(true)       // skips cert validation (use only for scraping)
         .danger_accept_invalid_hostnames(true)   // hostname mismatch accepted too
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
