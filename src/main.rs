@@ -23,6 +23,7 @@
 
 #[allow(dead_code)]
 #[allow(unused_imports)]
+use clap::{Parser, ArgAction};
 use anyhow::{bail, Context, Result};
 use log::{info, error, warn, debug, LevelFilter};
 use log4rs::append::console::ConsoleAppender;
@@ -63,12 +64,6 @@ use tokio::fs::create_dir_all;
 use tokio::net::TcpStream;
 use std::thread;
 use std::process::{Stdio};
-use bytes::Bytes;
-
-use hyper::{body::Incoming, Request};
-use hyper::client::conn::http1::Builder as HyperBuilder;
-use hyper_util::client::legacy::Client as LegacyClient;
-use http_body_util::Empty;
 
 /// Simple boxed error type
 type BoxResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -103,6 +98,20 @@ const LOG_PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S)(utc)} {h({l})} {m}{n}";
 const FILETYPES: &[&str] = &[
     ".mkv", ".mp4", ".avif", ".m4v",
 ];
+
+#[derive(Parser, Debug)]
+#[command(name = "nuascn", version, about = "RMZ / NF scraper/downloader", author = "Stuart Hunter (shunte88)")]
+struct Args {
+    /// Increase verbosity (-v = info, -vv = debug, -vvv = trace)
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
+    /// Route all HTTP/HTTPS + aria2c traffic through Tor (SOCKS5h)
+    #[arg(long)]
+    tor: bool,
+    /// Optional override URL, e.g. `nuascn https://my.link.com`
+    #[arg(value_name = "OVERRIDE_URL")]
+    override_url: Option<String>,
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -179,78 +188,42 @@ impl Aria2cRerun {
 
 }
 
+#[derive(Clone, Debug)]
 struct TorManager {
     addr: String,
-    child: Option<tokio::process::Child>,
     proxy_str: String,
 }
 
 impl TorManager {
-    async fn start() -> BoxResult<Self> {
+
+    async fn start(use_tor: bool) -> BoxResult<Self> {
 
         let port: u16 = 9050;
         let data_dir: PathBuf = "/data2/nuascn/.cache/tor_/".into();
-        let config_dir: PathBuf = "/etc/tor/torrc".into();
+        let _config_dir: PathBuf = "/etc/tor/torrc".into();
         fs::create_dir_all(&data_dir)?;
         let addr = format!("localhost:{port}");
-        let proxy_str = format!("socks5h://{}", addr.clone());
-    /*
-        // spawn tor
-        let program = "/usr/sbin/tor";
-
-        let mut args: Vec<String> = vec![
-            "-f".into(),
-            config_dir.to_string_lossy().to_string().clone().into(),
-            "--SOCKSPort".into(),
-            addr.clone(),
-            "--RunAsDaemon 1".into(),
-        ];
-
-        // these we just need to fire and forget
-        let command = format!("{} {}", program.clone(), args.join(" "));
-        info!("[tor] {}", command.clone());
-        let cmd = tokio::process::Command::new(program.clone())
-            .args(&args)
-            .kill_on_drop(true)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())       
-            .spawn()
-            .expect("failed to start tor process");
-
-        info!("[tor] {:#?}", cmd);
-        let mut ready = false;
-        for _ in 0..60 {
-            match TcpStream::connect(&addr.clone()).await {
-                Ok(_) => {
-                    ready = true;
-                    break;
-                }
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(250));
-                }
-            }
-        }
-
-        if !ready {
-            // if you prefer to hard-fail instead of warning, return Err here
-            warn!(
-                "Tor SOCKS port {} not reachable after waiting; \
-                 continuing but HTTP calls may fail.",
-                addr
-            );
+        let proxy_str = if use_tor {
+            format!("socks5h://{}", addr.clone())
         } else {
-            info!("Tor SOCKS port {} is up; routing HTTP via Tor.", addr.clone());
-        }
-*/
+            String::new()
+        };
         Ok(Self {
             addr,
-            child: None,
             proxy_str,
         })
 
     }
 
-        pub async fn assert_tor_running(&self) -> Result<()> {
+    fn add_tor_proxy(self, builder: ClientBuilder) -> ClientBuilder {
+        if !self.proxy_str.is_empty() {
+            builder.proxy(Proxy::all(self.proxy_str.clone()).unwrap())
+        } else {
+            builder
+        }
+    }
+
+    pub async fn is_tor_running(&self) -> Result<()> {
         // Make sure you are running tor and this is your socks port
         let proxy = reqwest::Proxy::all(self.proxy_str.clone())
             .context("Failed to construct Tor proxy URL")?;
@@ -262,30 +235,8 @@ impl TorManager {
         if !text.contains("Congratulations. This browser is configured to use Tor.") {
             bail!("Tor is currently not running")
         }
-
         Ok(())
     }
-
-    /*
-    fn apply_to_builder(
-        &self,
-        builder: ClientBuilder,
-    ) -> BoxResult<ClientBuilder> {
-        if let Some(ref p) = self.proxy_str {
-            let builder = builder.proxy(Proxy::all(p)?);
-            Ok(builder)
-        } else {
-            Ok(builder)
-        }
-    }
-
-    fn aria2_proxy_args(&self) -> Vec<String> {
-        match &self.proxy_str {
-            Some(p) => vec!["--all-proxy".into(), p.clone()],
-            None => Vec::new(),
-        }
-    }
-    */
 
     fn proxy_str(&self) -> String {
         self.proxy_str.clone()
@@ -293,16 +244,7 @@ impl TorManager {
 
 }
 
-// redundant - we setup auto drop & kill
-// can't hurt though
-impl Drop for TorManager {
-    fn drop(&mut self) {
-        //let _ = Some(self.child).kill();
-    }
-}
-
 #[derive(Clone, Debug)]
-
 struct Aria2cResult {
     good: bool,
     success: bool,
@@ -429,16 +371,18 @@ impl SceneDown {
     fn init(
         ux: &str, 
         px: &str,
-        proxy: &str
+        tunnel: TorManager
     ) -> BoxResult<Self> {
 
         const NTFURL_API: &str = "https://nitroflare.com/api/v2";
         let ntf_download_link: String = format!("{NTFURL_API}/getDownloadLink");
         let agent = user_agent();
-        let client = Client::builder()
+        let builder = Client::builder()
             .user_agent(agent)
-            .proxy(Proxy::all(proxy)?)
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(20));
+
+        let builder = tunnel.add_tor_proxy(builder);
+        let client = builder
             .build()?;
 
         Ok(Self {
@@ -616,6 +560,8 @@ fn load_interest_list(path: &str) -> BoxResult<HashSet<String>> {
 #[tokio::main]
 async fn main() -> BoxResult<()> {
 
+    let args = Args::parse();
+
     let h = Local::now();  // current time - used here to name the log, and later to drive runtime logic
 
     let stdout = ConsoleAppender::builder()
@@ -627,6 +573,12 @@ async fn main() -> BoxResult<()> {
         .build(log_file_name)
         .unwrap();
 
+    // set log level based on verbose
+    let loglev = match args.verbose {
+        0 => LevelFilter::Info,
+        1 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    };
     let config = Config::builder()
         .appender(Appender::builder().build(LOG_APPENDER_STDOUT, Box::new(stdout)))
         .appender(Appender::builder().build(LOG_APPENDER_FILE, Box::new(log_file)))
@@ -634,7 +586,7 @@ async fn main() -> BoxResult<()> {
             Root::builder()
                 .appender(LOG_APPENDER_STDOUT)
                 .appender(LOG_APPENDER_FILE)
-                .build(LevelFilter::Info), //Info
+                .build(loglev),
         )
         .unwrap();
     log4rs::init_config(config).unwrap();
@@ -646,29 +598,24 @@ async fn main() -> BoxResult<()> {
     }
 
     // note we are assuming the tor service has control here
-    let tunnel = TorManager::start().await?;
-    let proxy_str = tunnel.proxy_str();
-    //tunnel.assert_tor_running().await?;
+    // but can deactivate proxy usage via command line
+    let tunnel = TorManager::start(args.tor).await?;
 
+    // initiate downloader
     let sdx = SceneDown::init(
         ux.clone().as_str(),
         getenv("NTFLR_PREMIUM", "").as_str(),
-        proxy_str.as_str(),
+        tunnel.clone(),
     ).unwrap();
 
     let mut urls: Vec<String> = Vec::new();
 
     let mut single = false;
-    // seed urls with user-specified from command line
-    if let Some(arg_url) = env::args().nth(1) {
-        if arg_url.starts_with("http://") || arg_url.starts_with("https://") {
-            urls.push(arg_url);
-            single = true;
-        }
-    }
-
-    // if we don't have a url we synthesize
-    if urls.is_empty() {
+    if let Some(override_url) = args.override_url.clone() {
+        // positional override
+        urls.push(override_url);
+        single = true;
+    } else {
         // Generate HTML page URLs
         // 21 first outing of the day, 1AM, else 8 pages
         let pages: i32 = if h.hour()%2==0 {21} else {8};
@@ -682,13 +629,16 @@ async fn main() -> BoxResult<()> {
 
     // we create a client that plays nice with lazy 
     // web-masters that are not on top of their certs
+    // and in addition may use the tor proxy
     let agent = user_agent();
-    let client = Client::builder()
+    let builder = Client::builder()
         .user_agent(agent)
-        .proxy(Proxy::all(proxy_str.clone())?)
         .danger_accept_invalid_certs(true)       // skips cert validation (use only for scraping)
         .danger_accept_invalid_hostnames(true)   // hostname mismatch accepted too
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS));
+
+    let builder = tunnel.add_tor_proxy(builder);
+    let client = builder
         .build()?;
 
     let mut seen: HashSet<String> = HashSet::new();
@@ -699,9 +649,9 @@ async fn main() -> BoxResult<()> {
     let pub_date_str = now_fixed.to_rfc2822();
     let selector = Selector::parse("a").expect("Selector parse for <a> should never fail");
 
-    let urls1 = urls.clone();
+    let urls_clone = urls.clone();
     // Fetch and process all HTML pages in parallel with bounded concurrency
-    let stream = stream::iter(urls1.into_iter().map(|url| {
+    let stream = stream::iter(urls_clone.into_iter().map(|url| {
 
         let client = client.clone();
         let selector = selector.clone();
