@@ -191,6 +191,7 @@ impl Aria2cRerun {
 #[derive(Clone, Debug)]
 struct TorManager {
     addr: String,
+    active: bool,
     proxy_str: String,
 }
 
@@ -203,13 +204,16 @@ impl TorManager {
         let _config_dir: PathBuf = "/etc/tor/torrc".into();
         fs::create_dir_all(&data_dir)?;
         let addr = format!("localhost:{port}");
+        let mut active = false;
         let proxy_str = if use_tor {
+            active = true;
             format!("socks5h://{}", addr.clone())
         } else {
             String::new()
         };
         Ok(Self {
             addr,
+            active,
             proxy_str,
         })
 
@@ -363,6 +367,7 @@ struct SceneDown {
     ux: String,
     px: String,
     pub ntf_download_link: String,
+    pub ntf_captcha_link: String,
     max_retries: u32,
 }
 
@@ -376,6 +381,8 @@ impl SceneDown {
 
         const NTFURL_API: &str = "https://nitroflare.com/api/v2";
         let ntf_download_link: String = format!("{NTFURL_API}/getDownloadLink");
+        // throttling - error code 12
+        let ntf_captcha_link: String = format!("{NTFURL_API}/solveCaptcha?user={ux}");
         let agent = user_agent();
         let builder = Client::builder()
             .user_agent(agent)
@@ -390,6 +397,7 @@ impl SceneDown {
             ux: ux.to_string().clone(),
             px: px.to_string().clone(),
             ntf_download_link: ntf_download_link.clone(),
+            ntf_captcha_link: ntf_captcha_link.clone(),
             max_retries: 3
         })
     }
@@ -488,10 +496,12 @@ impl SceneDown {
         let result = match j_dl.get("result") {
             Some(r) => r,
             None => {
+                warn!("{}",self.ntf_download_link.clone());
                 warn!(
                     "JSON broken for file_id={}: (payload={:?})",
                     file_id, j_dl
                 );
+                info!("Throttling (12) in browser {}", self.ntf_captcha_link.clone());
                 return Ok(download);
             }
         };
@@ -601,6 +611,9 @@ async fn main() -> BoxResult<()> {
     // but can deactivate proxy usage via command line
     let tunnel = TorManager::start(args.tor).await?;
 
+    if tunnel.active{
+        info!{"Tor is in use"}
+    }
     // initiate downloader
     let sdx = SceneDown::init(
         ux.clone().as_str(),
