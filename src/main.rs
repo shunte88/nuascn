@@ -64,6 +64,8 @@ use tokio::fs::create_dir_all;
 use tokio::net::TcpStream;
 use std::thread;
 use std::process::{Stdio};
+use notify_rust::{Notification, Hint, Urgency};
+use webbrowser;
 
 /// Simple boxed error type
 type BoxResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -496,12 +498,17 @@ impl SceneDown {
         let result = match j_dl.get("result") {
             Some(r) => r,
             None => {
-                warn!("{}",self.ntf_download_link.clone());
                 warn!(
-                    "JSON broken for file_id={}: (payload={:?})",
-                    file_id, j_dl
+                    "{}\nJSON broken for file_id={}: (payload={:?})",
+                    self.ntf_download_link.clone(), file_id, j_dl
                 );
-                info!("Throttling (12) in browser {}", self.ntf_captcha_link.clone());
+                let err= match j_dl.get("code") {
+                    Some(e) => e,
+                    None => &Value::Null,
+                };
+                if !err.is_null() && err.as_str().unwrap()=="12" {
+                    pop_message(self.ntf_captcha_link.clone().as_str());
+                }
                 return Ok(download);
             }
         };
@@ -1087,6 +1094,29 @@ async fn main() -> BoxResult<()> {
 
     Ok(())
 
+}
+
+fn pop_message(url: &str) {
+
+    if webbrowser::open(url).is_ok() {
+        Notification::new()
+            .summary("Error 12 showCaptcha!")
+            .body("NF is getting miffed, run showCaptcha!")
+            .icon("dialog-warning")
+            .hint(Hint::Resident(true)) // Keeps notification visible until closed/actioned
+            .urgency(Urgency::Critical) // High importance notification
+            .action("default", "Show Captcha") // Default action
+            .show()
+            .unwrap()
+            .wait_for_action(|action| {
+                match action {
+                    "default" => println!("show captcha."),
+                    "__closed" => println!("Notification closed by user."), // Special keyword for closing
+                    _ => {}
+                }
+            });
+
+            }
 }
 
 async fn move_file(pe: &ProcessEntry) -> io::Result<()> {
