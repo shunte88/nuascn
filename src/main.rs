@@ -498,16 +498,17 @@ impl SceneDown {
         let result = match j_dl.get("result") {
             Some(r) => r,
             None => {
-                warn!(
-                    "{}\nJSON broken for file_id={}: (payload={:?})",
-                    self.ntf_download_link.clone(), file_id, j_dl
-                );
-                let err= match j_dl.get("code") {
+                let err= match j_dl.get("code").and_then(|v| v.as_str()) {
                     Some(e) => e,
-                    None => &Value::Null,
+                    None => "",
                 };
-                if !err.is_null() && err.as_str().unwrap()=="12" {
+                if err=="12" {
                     pop_message(self.ntf_captcha_link.clone().as_str());
+                }else {
+                    warn!(
+                        "{}\nJSON broken for file_id={}: (payload={:?}",
+                        self.ntf_download_link.clone(), file_id, j_dl
+                    );
                 }
                 return Ok(download);
             }
