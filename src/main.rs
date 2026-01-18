@@ -84,12 +84,12 @@ const MAX_CONCURRENCY: usize = 8;
 const REQUEST_TIMEOUT_SECS: u64 = 15;
 const MAX_RETRIES: u32 = 3;
 const VIDEO_RESOLUTION_1080: &str = "1080";
-const VIDEO_RESOLUTION_720: &str = "720ZZZ";    // munged
-const VIDEO_RESOLUTION_2160: &str = "2160ZZZ";  // munged
+const VIDEO_RESOLUTION_720: &str = "720";
+const VIDEO_RESOLUTION_2160: &str = "2160";  // munged
 const SPECIAL_CASES: &[&str] = &[
     "USA","FBI","BBC","US","AU","PL","IE","NZ","FR","DE","JP","UK",
     "QI","XL","SAS","RAF","WWII","WPC","LOL","VI","VII","VIII","VIIII","IX","II","III","IV",
-    "DCI","HD","W1A","HBO","100K",
+    "DCI","HD","W1A","HBO","100K", "VIP",
     "DC","DP", "X-MAS",
 ];
 const LOG_APPENDER_STDOUT: &str = "stdout";
@@ -107,6 +107,9 @@ struct Args {
     /// Increase verbosity (-v = info, -vv = debug, -vvv = trace)
     #[arg(short, long, action = ArgAction::Count)]
     verbose: u8,
+    /// skip format and codec testing
+    #[arg(long)]
+    skip: bool,
     /// Route all HTTP/HTTPS + aria2c traffic through Tor (SOCKS5h)
     #[arg(long)]
     tor: bool,
@@ -498,13 +501,16 @@ impl SceneDown {
         let result = match j_dl.get("result") {
             Some(r) => r,
             None => {
-                let err= match j_dl.get("code").and_then(|v| v.as_str()) {
+                let err= match j_dl.get("code").and_then(|v| v.as_i64()) {
                     Some(e) => e,
-                    None => "",
+                    None => 0,
                 };
-                if err=="12" {
-                    pop_message(self.ntf_captcha_link.clone().as_str());
-                }else {
+
+                if err==-12 { // negate for now
+                    pop_message(self.ntf_captcha_link.clone().as_str(), err);
+                    // call again
+                    
+                } else {
                     warn!(
                         "{}\nJSON broken for file_id={}: (payload={:?}",
                         self.ntf_download_link.clone(), file_id, j_dl
@@ -529,6 +535,24 @@ impl SceneDown {
 
     }
 
+}
+
+/// Detect the best known resolution marker inside a title/link.
+/// Higher is better, so it can be used for promotion decisions.
+///
+/// Promotion ladder (extensible): 720 < 1080 < 2160
+fn detect_quality_rank(s: &str) -> u16 {
+    let up = s.to_ascii_uppercase();
+    // Keep highest first.
+    if up.contains(VIDEO_RESOLUTION_2160) {
+        2160
+    } else if up.contains(VIDEO_RESOLUTION_1080) {
+        1080
+    } else if up.contains(VIDEO_RESOLUTION_720) {
+        720
+    } else {
+        0
+    }
 }
 
 /// Normalize show name for comparison:
@@ -622,6 +646,9 @@ async fn main() -> BoxResult<()> {
     if tunnel.active{
         info!{"Tor is in use"}
     }
+
+    let mut ignore_tests = args.skip;
+
     // initiate downloader
     let sdx = SceneDown::init(
         ux.clone().as_str(),
@@ -639,7 +666,7 @@ async fn main() -> BoxResult<()> {
     } else {
         // Generate HTML page URLs
         // 21 first outing of the day, 1AM, else 8 pages
-        let pages: i32 = if h.hour()%2==0 {21} else {8};
+        let pages: i32 = if h.hour()%2==0 {31} else {8};
         urls = build_urls(BASE_URL, pages);
     }
 
@@ -677,9 +704,19 @@ async fn main() -> BoxResult<()> {
         let client = client.clone();
         let selector = selector.clone();
         let key: &str = "";
+        let mut ignore = ignore_tests;
 
         async move {
-            match process_page_with_retries(&client, &selector, &url, MAX_RETRIES, false, key, false).await {
+            match process_page_with_retries(
+                &client, 
+                &selector, 
+                &url, 
+                MAX_RETRIES, 
+                false, 
+                key, 
+                false,
+                ignore,
+            ).await {
                 Ok(links) => {
                     if !links.is_empty() {
                         info!("Found {:>2} links for {}", links.len(), url);
@@ -719,7 +756,16 @@ async fn main() -> BoxResult<()> {
         let key: &str = "";
         let selector = Selector::parse("pre.links").expect("valid <pre class=\"links\"> selector");
 
-        match process_page_with_retries(&client, &selector, &url, MAX_RETRIES, true, key, false).await {
+        match process_page_with_retries(
+            &client, 
+            &selector, 
+            &url, 
+            MAX_RETRIES, 
+            true, 
+            key, 
+            false, 
+            ignore_tests,
+        ).await {
             Ok(links) => {
                 if !links.is_empty() {
                     let mut hrefs: Vec<(String, String)> = Vec::new();
@@ -912,7 +958,37 @@ async fn main() -> BoxResult<()> {
         }
 
         // are we already on the stack?
-        if process_map.contains_key(&key) {
+        if let Some(existing) = process_map.get(&key) {
+            // Promotion: if we already accepted (say) a 720p and we later see a 1080p
+            // for the same show+episode key, prefer the higher-quality entry.
+            // (Extensible ladder: 720 < 1080 < 2160)
+            if !existing.rerun {
+                let old_rank = detect_quality_rank(&existing.title);
+                let new_rank = detect_quality_rank(&raw_title);
+
+                if new_rank > old_rank {
+                    info!("{key} -> promoting from {}p to {}p", old_rank, new_rank);
+
+                    // Overwrite the process entry with better source details.
+                    // Key stays identical; we keep rerun=false.
+                    process_map.insert(
+                        key.clone(),
+                        ProcessEntry {
+                            key: key.clone(),
+                            rerun: false,
+                            title: raw_title.clone(),
+                            show_name: show_name_norm.clone(),
+                            folder: folder_name.clone(),
+                            sanitized_name: sanitized_name.clone(),
+                            extention: String::new(),
+                            link: link.clone(),
+                            file_id: String::new(),
+                            nf_view: String::new(),
+                            nf_down: String::new(),
+                        },
+                    );
+                }
+            }
             continue;
         }
 
@@ -1010,7 +1086,9 @@ async fn main() -> BoxResult<()> {
                 MAX_RETRIES, 
                 true, 
                 entry.clone().as_str(),
-                rerun).await 
+                rerun,
+                ignore_tests,
+            ).await 
             {
                 Ok(links) => {
                     links
@@ -1097,11 +1175,11 @@ async fn main() -> BoxResult<()> {
 
 }
 
-fn pop_message(url: &str) {
+fn pop_message(url: &str, err: i64) {
 
     if webbrowser::open(url).is_ok() {
         Notification::new()
-            .summary("Error 12 showCaptcha!")
+            .summary(format!("Error {err} showCaptcha!").as_str())
             .body("NF is getting miffed, run showCaptcha!")
             .icon("dialog-warning")
             .hint(Hint::Resident(true)) // Keeps notification visible until closed/actioned
@@ -1255,6 +1333,7 @@ async fn process_page_with_retries(
     use_sse: bool,
     key: &str,
     rerun: bool,
+    mut skip: bool,
 ) -> BoxResult<Vec<(String, String)>> {
 
     if rerun {
@@ -1265,7 +1344,7 @@ async fn process_page_with_retries(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match process_page(client, selector, url, use_sse, key).await {
+        match process_page(client, selector, url, use_sse, key, skip).await {
             Ok(res) => {
                 return Ok(res);
             }
@@ -1343,7 +1422,8 @@ async fn process_rss(client: &Client, url: &str, source: Source) -> BoxResult<Ve
             _ => continue,
         };
 
-        if !link_matches(&title, &href) {
+        let mut skip = false;
+        if !link_matches(&title, &href, skip) {
             continue;
         }
 
@@ -1383,6 +1463,7 @@ async fn process_page(
     url: &str,
     use_sse: bool,
     key: &str,
+    mut skip: bool,
 ) -> BoxResult<Vec<(String, String)>> {
 
     let base_url = Url::parse(url)?;
@@ -1422,7 +1503,7 @@ async fn process_page(
             {
                 good = true;
             }
-
+println!("{cleaned}");
             // For these, we just use the URL as both title & href
             results.push((key.to_string(), cleaned.to_string()));
 
@@ -1439,7 +1520,7 @@ async fn process_page(
                 None => continue,
             };
 
-            if !link_matches(&text, href_raw) {
+            if !link_matches(&text, href_raw, skip) {
                 continue;
             }
 
@@ -1471,7 +1552,13 @@ async fn process_page(
 /// - Text contains "NF" (case-insensitive)
 /// - href contains "1080" and (x265|h265|HEVC|AV1)
 /// - OR href contains "2160" and (x265|h265|HEVC|AV1)
-fn link_matches(text: &str, href: &str) -> bool {
+fn link_matches(text: &str, href: &str, mut force_good: bool) -> bool {
+
+    if force_good {
+        force_good = false;
+        return true;
+    }
+
     let text_upper = text.to_ascii_uppercase();
     if !text_upper.contains("NF") {
         return false;
@@ -1484,7 +1571,7 @@ fn link_matches(text: &str, href: &str) -> bool {
                 || href_upper.contains("H265")
                 || href_upper.contains("HEVC")
                 || href_upper.contains("AV1"));
-    // skip these
+
     if !good_link {
         good_link = href_upper.contains(VIDEO_RESOLUTION_2160)
             && (href_upper.contains("X265")
@@ -1661,269 +1748,3 @@ fn getenv(key: &str, defo: &str) -> String {
         Err(_e) => defo.to_string().clone()
     }
 }
-
-
-/*
-
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-/// Ensure parent directory exists (mkdir -p)
-fn ensure_parent_dir(path: &Path) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
-/// Write an aria2 input file and return its path
-fn write_aria2_input_file(downloads: &[(String, PathBuf)]) -> BoxResult<PathBuf> {
-    // simple temp name: ./aria2_batch_<epoch>.txt
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs();
-
-    let list_path = PathBuf::from(format!("aria2_batch_{now}.txt"));
-    let mut f = File::create(&list_path)?;
-
-    for (url, dest) in downloads {
-        if url.trim().is_empty() {
-            warm!("Empty URL, skipping");
-            continue;
-        }
-
-        // Ensure destination directory exists
-        ensure_parent_dir(dest)?;
-
-        let file_name = dest
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let dir = dest
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_string_lossy()
-            .to_string();
-
-        writeln!(f, "{}", url)?;
-        writeln!(f, "  dir={}", dir)?;
-        writeln!(f, "  out={}", file_name)?;
-        writeln!(f)?; // blank line between entries
-    }
-
-    f.flush()?;
-    Ok(list_path)
-}
-
-/// Run aria2c once to download all entries from the list file
-fn run_aria2_batch(list_path: &Path) -> BoxResult<()> {
-    let status = Command::new("aria2c")
-        // Use the input file
-        .arg("--input-file")
-        .arg(list_path)
-
-        // Robustness / resume
-        .arg("--continue=true")               // resume partial
-        .arg("--max-tries=5")                 // aria2 internal retries
-        .arg("--retry-wait=10")               // seconds between retries
-        .arg("--auto-file-renaming=false")    // don't rename on conflicts
-        .arg("--allow-overwrite=true")        // overwrite if re-running
-
-        // Parallelism / performance – tune as desired
-        .arg("--max-concurrent-downloads=4")
-        .arg("--split=8")                     // connections per download
-        .arg("--min-split-size=5M")
-
-        // Logging / progress
-        .arg("--summary-interval=60")         // fewer log updates
-        .status()?;
-
-    if !status.success() {
-        return Err(format!("aria2c exited with status: {:?}", status.code()).into());
-    }
-
-    Ok(())
-}
-
-/// Public helper: given (url, dest_path) pairs, download them all via a single aria2c call
-pub fn download_with_aria2_batch(downloads: &[(String, PathBuf)]) -> BoxResult<()> {
-    if downloads.is_empty() {
-        println!("[info] No downloads provided, skipping aria2c call.");
-        return Ok(());
-    }
-
-    let list_path = write_aria2_input_file(downloads)?;
-    println!(
-        "[info] Written aria2 batch file: {}",
-        list_path.to_string_lossy()
-    );
-
-    match run_aria2_batch(&list_path) {
-        Ok(()) => {
-            println!("[info] aria2c batch completed successfully.");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("[error] aria2c batch failed: {}", e);
-            Err(e)
-        }
-    }
-}
-
-
-*/
-
-
-/*
-use std::process::Command;
-use std::path::PathBuf;
-use std::fs;
-use std::io::Write;
-use chrono::Utc;
-
-// Your existing KV append format: "key|timestamp\n"
-fn append_seen(key: &str, db_path: &str) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(db_path)?;
-    let ts = Utc::now().to_rfc3339();
-    writeln!(f, "{}|{}", key, ts)?;
-    Ok(())
-}
-
-fn run_aria2_batch(list_path: &str) -> std::io::Result<bool> {
-    let status = Command::new("aria2c")
-        .arg("--input-file").arg(list_path)
-        .arg("--continue=true")
-        .arg("--max-tries=5")
-        .arg("--retry-wait=10")
-        .arg("--auto-file-renaming=false")
-        .arg("--allow-overwrite=true")
-        .arg("--max-concurrent-downloads=4")
-        .arg("--split=8")
-        .arg("--min-split-size=5M")
-        .status()?;
-
-    Ok(status.success())
-}
-
-pub fn download_and_mark_seen(
-    jobs: &[(String, PathBuf, String)], // (url, dest, key)
-    db_path: &str,
-) -> BoxResult<()> {
-    // 1. write aria2 input file from (url, dest)
-    let aria_jobs: Vec<(String, PathBuf)> = jobs
-        .iter()
-        .map(|(u, d, _k)| (u.clone(), d.clone()))
-        .collect();
-
-    let list_path = write_aria2_input_file(&aria_jobs)?; // your existing helper
-
-    // 2. run aria2c
-    let ok = run_aria2_batch(list_path.to_str().unwrap())?;
-    if !ok {
-        warn!("aria2c returned non-success exit code; will still check files");
-    }
-
-    // 3. for each job, if dest exists and non-zero, mark as seen
-    for (_, dest, key) in jobs {
-        match fs::metadata(dest) {
-            Ok(meta) if meta.is_file() && meta.len() > 0 => {
-                println!("[ok  ] Completed {}, marking seen: {}", dest.display(), key);
-                append_seen(key, db_path)?;
-            }
-            _ => {
-                warn!("Destination folder not present or empty, not marking seen: {} ({})",
-                          dest.display(), key);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-*/
-
-
-/*
-
-use std::fs;
-use std::path::{Path, PathBuf};
-
-/// Here we assume autoallocate is true so checking filesize
-/// is redundant - we monitor the sidecar file instead
-/// Given the final target file path, build the aria2 sidecar path:
-/// "/path/to/file.mkv" -> "/path/to/file.mkv.aria2"
-fn aria2_sidecar_path(dest: &Path) -> PathBuf {
-    let mut s = dest.as_os_str().to_owned();
-    s.push(".aria2");
-    PathBuf::from(s)
-}
-
-/// True if aria2 appears to have completed this download:
-/// - main file exists AND
-/// - sidecar (*.aria2) does NOT exist
-fn is_aria2_complete(dest: &Path) -> bool {
-    let sidecar = aria2_sidecar_path(dest);
-    dest.is_file() && !sidecar.exists()
-}
-
-fn partition_jobs_by_completion(jobs: &[Job]) -> (Vec<Job>, Vec<Job>) {
-    let mut completed = Vec::new();
-    let mut incomplete = Vec::new();
-
-    for (url, dest, key) in jobs {
-        if is_aria2_complete(dest) {
-            completed.push((url.clone(), dest.clone(), key.clone()));
-        } else {
-            incomplete.push((url.clone(), dest.clone(), key.clone()));
-        }
-    }
-
-    (completed, incomplete)
-}
-
-fn main() -> BoxResult<()> {
-
-    let jobs: Vec<Job> = vec![
-        (
-            "https://nitroflare.com/view/...".to_string(),
-            PathBuf::from("/data2/videos/Our.Cartoon.President/Our.Cartoon.President.US.S01E08.mkv"),
-            "OUR.CARTOON.PRESIDENT.US.S01E08".to_string(),
-        ),
-        // more jobs...
-    ];
-
-    let db_path = ".cache/seen_shows.db";
-
-    let mut remaining = jobs;
-    let mut round = 1;
-
-    loop {
-        println!("[info] Round {} – {} jobs", round, remaining.len());
-        if remaining.is_empty() {
-            break;
-        }
-
-        remaining = run_and_update_seen(&remaining, db_path)?;
-        if remaining.is_empty() {
-            println!("[info] All downloads completed.");
-            break;
-        }
-
-        round += 1;
-        // optional: sleep/backoff before next attempt
-    }
-
-    Ok(())
-}
-
-
-*/
