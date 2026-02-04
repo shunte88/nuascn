@@ -1488,6 +1488,9 @@ async fn process_page(
             if raw_text.trim().is_empty() {
                 continue;
             }
+            if raw_text.trim().to_lowercase().ends_with(".srt") {
+                continue;
+            }
 
             let cleaned = raw_text;
             let upper = cleaned.to_ascii_uppercase();
@@ -1495,7 +1498,7 @@ async fn process_page(
                 continue;
             }
 
-            // last check - is it playable
+            // last check - is it playable - is .srt issue here???
             let mut good = false;
             if FILETYPES
                 .iter()
@@ -1503,7 +1506,7 @@ async fn process_page(
             {
                 good = true;
             }
-println!("{cleaned}");
+
             // For these, we just use the URL as both title & href
             results.push((key.to_string(), cleaned.to_string()));
 
