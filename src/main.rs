@@ -510,6 +510,10 @@ impl SceneDown {
                     pop_message(self.ntf_captcha_link.clone().as_str(), err);
                     // call again
                     
+                } else if err==12 {                    
+                    warn!("{}",self.ntf_captcha_link.clone().as_str());
+                    warn!("{}",self.ntf_captcha_link.clone().as_str());
+                    warn!("{}",self.ntf_captcha_link.clone().as_str());
                 } else {
                     warn!(
                         "{}\nJSON broken for file_id={}: (payload={:?}",
