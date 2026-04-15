@@ -90,7 +90,7 @@ const SPECIAL_CASES: &[&str] = &[
     "USA","FBI","BBC","US","AU","PL","IE","NZ","FR","DE","JP","UK",
     "QI","XL","SAS","RAF","WWII","WPC","LOL","VI","VII","VIII","VIIII","IX","II","III","IV",
     "DCI","HD","W1A","HBO","100K", "VIP",
-    "DC","DP", "X-MAS",
+    "DC","DP", "X-MAS", "DTF",
 ];
 const LOG_APPENDER_STDOUT: &str = "stdout";
 const LOG_APPENDER_FILE: &str = "file";
@@ -1219,12 +1219,20 @@ async fn move_file(pe: &ProcessEntry) -> io::Result<()> {
 async fn aria2c_download(pe: &ProcessEntry, arr: &mut Aria2cRerun) -> BoxResult<Aria2cResult> {
 
     let mut ret = Aria2cResult::init(pe.key.clone()).unwrap();
-    // Try to detect filename before handing to aria2c
     let aria2c_path = "aria2c";
     let filename = format!("{}{}", pe.sanitized_name, pe.extention);
     let rerun = pe.rerun;
+    let dest = Path::new(&pe.folder).join(&filename);
 
     fs::create_dir_all(pe.folder.clone())?;
+
+    // Skip if already downloaded successfully
+    if fs::metadata(&dest).map(|m| m.len() > 1024).unwrap_or(false) {
+        info!("[aria2c] Skipping (exists): {filename}");
+        ret.success = true;
+        ret.good = true;
+        return Ok(ret);
+    }
 
     // Build command: aria2c --dir <dir> --out <filename> [args...] <url>
     let mut args: Vec<String> = vec![
@@ -1243,24 +1251,44 @@ async fn aria2c_download(pe: &ProcessEntry, arr: &mut Aria2cRerun) -> BoxResult<
     ];
     args.push(pe.nf_down.clone().into());
 
-    // these we just need to fire and forget
     let command = format!("{} {}", aria2c_path, args.join(" "));
-    debug!("[aria2c] {}", command.clone());
-    let status = Command::new(aria2c_path).args(&args).status().await?;
-    debug!("[aria2c] {} {}", status, status.success());
+    debug!("[aria2c] {}", command);
 
-    ret.success = status.success();
-
-    if !status.success() {
-        error!("aria2c failed -> {status}");
-        if !rerun {
-            arr.write_rerun(command.clone())?;
+    for attempt in 1..=3u32 {
+        if attempt > 1 {
+            let _ = fs::remove_file(&dest);
+            sleep(Duration::from_secs(3)).await;
+            info!("[aria2c] Retrying ({attempt}/3): {filename}");
         }
-        ret.good = true; // added to rerun (so rerun is consumed and not picked up from the scrape), and we close out
-    }else{
-        ret.good = true; // close out
+
+        let status = Command::new(aria2c_path).args(&args).status().await?;
+        debug!("[aria2c] {} {}", status, status.success());
+
+        if !status.success() {
+            warn!("[aria2c] attempt {attempt} failed -> {status}");
+            continue;
+        }
+
+        // Check for error-page response (< 1KB means Nitroflare returned an error body)
+        match fs::metadata(&dest) {
+            Ok(m) if m.len() < 1024 => {
+                warn!("[aria2c] attempt {attempt}: {filename} is {} bytes — error response, retrying", m.len());
+            }
+            Ok(_) => {
+                ret.success = true;
+                ret.good = true;
+                return Ok(ret);
+            }
+            Err(e) => warn!("[aria2c] attempt {attempt}: cannot stat {filename}: {e}"),
+        }
     }
 
+    // All attempts failed
+    error!("[aria2c] all attempts failed for {filename}");
+    if !rerun {
+        arr.write_rerun(command)?;
+    }
+    ret.good = true; // consumed — don't re-pick from scrape
     Ok(ret)
 
 }
