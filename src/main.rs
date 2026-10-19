@@ -54,7 +54,7 @@ use futures::{stream, StreamExt};
 use reqwest::{Proxy, Client, ClientBuilder, StatusCode};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, RANGE};
 use rss::{Channel, ChannelBuilder, Item, ItemBuilder};
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use tokio::time::{error::Elapsed, sleep};
 use url::Url;
 use regex::Regex;
@@ -110,6 +110,9 @@ struct Args {
     /// skip format and codec testing
     #[arg(long)]
     skip: bool,
+    /// with OVERRIDE_URL: drop links with a pubDate older than 28 days
+    #[arg(long)]
+    strict: bool,
     /// Route all HTTP/HTTPS + aria2c traffic through Tor (SOCKS5h)
     #[arg(long)]
     tor: bool,
@@ -650,6 +653,7 @@ async fn main() -> BoxResult<()> {
     if tunnel.active{
         info!{"Tor is in use"}
     }
+    info!("Strict is {}", if args.strict {"on"} else {"off"});
 
     let mut ignore_tests = args.skip;
 
@@ -709,6 +713,7 @@ async fn main() -> BoxResult<()> {
         let selector = selector.clone();
         let key: &str = "";
         let mut ignore = ignore_tests;
+        let strict = single && args.strict;
 
         async move {
             match process_page_with_retries(
@@ -720,6 +725,7 @@ async fn main() -> BoxResult<()> {
                 key, 
                 false,
                 ignore,
+                strict,
             ).await {
                 Ok(links) => {
                     if !links.is_empty() {
@@ -769,6 +775,7 @@ async fn main() -> BoxResult<()> {
             key, 
             false, 
             ignore_tests,
+            false,
         ).await {
             Ok(links) => {
                 if !links.is_empty() {
@@ -829,6 +836,13 @@ async fn main() -> BoxResult<()> {
                 error!("Processing RSS with error: {}", e);
             }
         }
+    }
+
+    if single && args.strict {
+        let cutoff = now_fixed - chrono::TimeDelta::days(28);
+        let before = feed_items.len();
+        feed_items.retain(|fi| fi.pub_date >= cutoff);
+        info!("Strict: dropped {} items older than 28 days", before - feed_items.len());
     }
 
     if !feed_items.is_empty() {
@@ -1092,6 +1106,7 @@ async fn main() -> BoxResult<()> {
                 entry.clone().as_str(),
                 rerun,
                 ignore_tests,
+                false,
             ).await 
             {
                 Ok(links) => {
@@ -1366,6 +1381,7 @@ async fn process_page_with_retries(
     key: &str,
     rerun: bool,
     mut skip: bool,
+    strict: bool,
 ) -> BoxResult<Vec<(String, String)>> {
 
     if rerun {
@@ -1376,7 +1392,7 @@ async fn process_page_with_retries(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match process_page(client, selector, url, use_sse, key, skip).await {
+        match process_page(client, selector, url, use_sse, key, skip, strict).await {
             Ok(res) => {
                 return Ok(res);
             }
@@ -1496,6 +1512,7 @@ async fn process_page(
     use_sse: bool,
     key: &str,
     mut skip: bool,
+    strict: bool,
 ) -> BoxResult<Vec<(String, String)>> {
 
     let base_url = Url::parse(url)?;
@@ -1559,6 +1576,10 @@ async fn process_page(
                 continue;
             }
 
+            if strict && listing_age_days(el).is_some_and(|d| d > 28) {
+                continue;
+            }
+
             let href = match base_url.join(href_raw) {
                 Ok(u) => u.to_string(),
                 Err(_) => {
@@ -1581,6 +1602,27 @@ async fn process_page(
 
     Ok(results)
 
+}
+
+/// Age in days from the listing's DIS_time ("4&nbsp;days").
+/// Missing DIS_time -> None (kept); any unit beyond days/weeks -> i64::MAX (dropped)
+fn listing_age_days(el: ElementRef) -> Option<i64> {
+    let sel = Selector::parse(".DIS_time").expect("valid .DIS_time selector");
+    for anc in el.ancestors().filter_map(ElementRef::wrap) {
+        let mut hits = anc.select(&sel);
+        if let Some(t) = hits.next() {
+            if hits.next().is_some() {
+                return None; // container spans several listings - can't tell which is ours
+            }
+            let txt = t.text().collect::<String>().replace('\u{a0}', " ");
+            let n: i64 = txt.split_whitespace().next()?.parse().ok()?;
+            // only days/weeks count as recent, months/years etc are always too old
+            let mult = [("day", 1), ("week", 7), ("hour", 0), ("min", 0)]
+                .iter().find(|(u, _)| txt.contains(u)).map_or(i64::MAX, |m| m.1);
+            return Some(n.saturating_mul(mult));
+        }
+    }
+    None
 }
 
 /// Matching rules:
@@ -1781,5 +1823,26 @@ fn getenv(key: &str, defo: &str) -> String {
     match env::var(key) {
         Ok(val) => val,
         Err(_e) => defo.to_string().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dis_time_age() {
+        let html = r#"<ul>
+            <li><a href="/a">A</a><span class="DIS_time">4&nbsp;days</span></li>
+            <li><a href="/b">B</a><span class="DIS_time">30&nbsp;days</span></li>
+            <li><a href="/c">C</a><span class="DIS_time">5&nbsp;hours</span></li>
+            <li><a href="/d">D</a></li>
+            <li><a href="/e">E</a><span class="DIS_time">4&nbsp;years</span></li>
+            <li><a href="/f">F</a><span class="DIS_time">1&nbsp;week</span></li>
+        </ul>"#;
+        let doc = Html::parse_document(html);
+        let a = Selector::parse("a").unwrap();
+        let ages: Vec<_> = doc.select(&a).map(listing_age_days).collect();
+        assert_eq!(ages, vec![Some(4), Some(30), Some(0), None, Some(i64::MAX), Some(7)]);
     }
 }
